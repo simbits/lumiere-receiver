@@ -1,2 +1,2 @@
-# lumiere-receiver
-Lumiere projector receiver utility
+# lumiere-utilities
+Lumiere projector utilities
