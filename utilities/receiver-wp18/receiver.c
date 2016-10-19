@@ -130,7 +130,7 @@ int main(int argc, char **argv)
     bcm2835_gpio_fsel(OUTPIN, BCM2835_GPIO_FSEL_OUTP);
     bcm2835_gpio_fsel(INPIN, BCM2835_GPIO_FSEL_INPT);
     bcm2835_gpio_set_pud(INPIN, BCM2835_GPIO_PUD_OFF);
-    bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPUT));
+    bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
 
     srand(time(NULL));
 
@@ -142,13 +142,13 @@ int main(int argc, char **argv)
             int level = 0;
 
             if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPUT));
+            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
             bcm2835_delay(200);
             if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPUT));
+            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
             bcm2835_delay(200);
             if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPUT));
+            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
 
             if (level >= 2) {
                 path = argv[2];
