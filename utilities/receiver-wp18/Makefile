@@ -1,5 +1,5 @@
-OBJS=receiver-wp18.o
-BIN=receiver-wp18
+OBJS=receiver.o
+BIN=receiver
 
 CFLAGS+=-Wall -g -O3
 LDFLAGS+=-lm -lrt -lz -lc -lbcm2835 -lpthread
@@ -9,7 +9,7 @@ INCLUDES+=-I/opt/vc/include/ -I/opt/vc/include/interface/vcos/pthreads -I/opt/vc
 all: $(BIN)
 
 %.o: %.c
-	@rm -f $@ 
+	@rm -f $@
 	$(CC) $(CFLAGS) $(INCLUDES) -g -c $< -o $@ -Wno-deprecated-declarations
 
 $(BIN): $(OBJS)
