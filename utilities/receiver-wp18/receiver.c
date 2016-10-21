@@ -1,33 +1,113 @@
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <assert.h>
+#include <string.h>
+#include <termios.h>
+#include <time.h>
 #include <unistd.h>
+
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <time.h>
-#include <stdlib.h>
-#include <strings.h>
-#include <string.h>
-#include <errno.h>
 
 #include <bcm2835.h>
+#include <lo/lo.h>
 
 #define PLAY        'P'
 #define DELAY       'D'
 
 #define MAX_SEQ_LINES   1024
 
-#define INPIN 30      /* for Projector */
-#define OUTPIN 31
-#define LED_PIN 19      /* LED pin */
+#define MASTER_DETECT_PIN   37      /* Master/Slave detect */
+#define SIGNAL_IN_PIN       30      /* signal pulse input*/
+#define SIGNAL_OUT_PIN      31      /* signal pulse output */
+#define RS485_DE_PIN        39      /* RS485 Data Enable */
 
-#define READVAL()  bcm2835_gpio_lev( INPIN )
+#define RS485_TTY           "/dev/ttyS0"
+#define RS485_BAUDRATE      B9600
+
+#define IS_UNKNOWN -1
+#define IS_MASTER   0
+#define IS_SLAVE    1
+
+#define READVAL()  bcm2835_gpio_lev( SIGNAL_IN_PIN )
 
 #include <stdio.h>
+
+const char *program = NULL;
+int done = 0;
+int master = IS_UNKNOWN;
+
+void execute_line(unsigned int n);
+
+void usage(void)
+{
+    fprintf(stderr, "Usage: %s -p <OSC port> <sequence file>\n", program);
+    fprintf(stderr, "    -p - set osc listen / send port\n");
+
+    exit(1);
+}
+
+void osc_error(int num, const char *msg, const char *path)
+{
+        fprintf(stderr, "liblo server error %d in path %s: %s\n", num, path, msg);
+}
+
+/* catch any incoming messages and display them. returning 1 means that the
+ *  * message has not been fully handled and the server should try other methods */
+int generic_handler(const char *path, const char *types, lo_arg ** argv,
+                            int argc, void *data, void *user_data)
+{
+        int i;
+
+    printf("path: <%s>\n", path);
+    for (i = 0; i < argc; i++) {
+        printf("arg %d '%c' ", i, types[i]);
+        lo_arg_pp((lo_type)types[i], argv[i]);
+        printf("\n");
+    }
+    printf("\n");
+    fflush(stdout);
+
+    return 1;
+}
+
+int play_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+        /* example showing pulling the argument values out of the argv array */
+        printf("%s <- i:%d\n\n", path, argv[0]->i);
+        fflush(stdout);
+
+        execute_line(argv[0]->i);
+
+        return 0;
+}
+
+int quit_handler(const char *path, const char *types, lo_arg ** argv,
+                         int argc, void *data, void *user_data)
+{
+        done = 1;
+        printf("quiting\n\n");
+
+        return 0;
+}
+
+void read_stdin(void)
+{
+    char buf[256];
+    int len = read(0, buf, 256);
+    if (len > 0) {
+        printf("stdin: ");
+        fwrite(buf, len, 1, stdout);
+        printf("\n");
+        fflush(stdout);
+    }
+}
 
 char *sequence_lines[MAX_SEQ_LINES];
 
@@ -61,7 +141,7 @@ static inline uint64_t wait_for_rising()
     uint64_t start = bcm2835_st_read();
     while ( ! READVAL() )
         bcm2835_delayMicroseconds(200);
-    bmc2835_gpio_write(OUTPIN, HIGH);
+    bcm2835_gpio_write(SIGNAL_OUT_PIN, HIGH);
     return bcm2835_st_read() - start;
 }
 
@@ -70,7 +150,7 @@ static inline uint64_t wait_for_falling()
     uint64_t start = bcm2835_st_read();
     while ( READVAL() )
         bcm2835_delayMicroseconds(200);
-    bmc2835_gpio_write(OUTPIN, LOW);
+    bcm2835_gpio_write(SIGNAL_OUT_PIN, LOW);
     return bcm2835_st_read() - start;
 }
 
@@ -117,53 +197,178 @@ void execute_line(unsigned int n)
     }
 }
 
+int is_master(void)
+{
+    if  (master == IS_UNKNOWN) {
+        master = bcm2835_gpio_lev(MASTER_DETECT_PIN);
+    }
+    return (master == IS_MASTER) ? IS_MASTER : IS_SLAVE;
+}
+
+void initialize_gpio_pins(void)
+{
+    /* set pin directions */
+    bcm2835_gpio_fsel(MASTER_DETECT_PIN, BCM2835_GPIO_FSEL_INPT);
+    bcm2835_gpio_fsel(SIGNAL_OUT_PIN, BCM2835_GPIO_FSEL_OUTP);
+    bcm2835_gpio_fsel(SIGNAL_IN_PIN, BCM2835_GPIO_FSEL_INPT);
+    bcm2835_gpio_fsel(RS485_DE_PIN, BCM2835_GPIO_FSEL_OUTP);
+
+    /* SIGNAL_IN_PIN pull up enable. SIGNAL_OUT_PIN mimics in pin level */
+    bcm2835_gpio_set_pud(SIGNAL_IN_PIN, BCM2835_GPIO_PUD_UP);
+    bcm2835_gpio_write(SIGNAL_OUT_PIN, bcm2835_gpio_lev(SIGNAL_IN_PIN));
+
+    /* MASTER_DETECT_PIN pull up enable */
+    bcm2835_gpio_set_pud(MASTER_DETECT_PIN, BCM2835_GPIO_PUD_UP);
+
+    /* RS485_DE_PIN low level */
+    bcm2835_gpio_write(RS485_DE_PIN, LOW);
+}
+
+int initialize_RS485(const char *tty)
+{
+    struct termios termConfig, savedTermConfig;
+    int    fd = -1;
+
+    if ((fd = open(tty, O_RDWR | O_NOCTTY /*| O_NDELAY*/)) < 0) {
+        fprintf(stderr, "Could not open tty '%s': %s", tty, strerror(errno));
+        return -1;
+    }
+
+    if (!isatty(fd)) {
+        fprintf(stderr, "%s is not atty\n", tty);
+        return -1;
+    }
+
+    if (tcgetattr(fd, &termConfig) < 0) {
+        fprintf(stderr, "%s tcgetattr failed\n", tty);
+        return -1;
+    }
+
+    memcpy(&savedTermConfig, &termConfig, sizeof(struct termios));
+
+    fcntl(fd, F_SETFL, 0);
+
+    /* control options: 8n1 */
+    termConfig.c_cflag |=  (CREAD | CLOCAL);
+    termConfig.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
+    termConfig.c_cflag |=  CS8;
+#if defined(CNEW_RTSCTS)
+    termConfig.c_cflag &= ~CNEW_RTSCTS;	/* disable hw flow control */
+#endif
+
+    /* line options: non-canonical, no echo, no signals */
+    termConfig.c_lflag &= ~(ICANON  | ECHO   | ECHOE  | ECHOK | ECHONL |
+                            ECHOCTL | ECHOKE | IEXTEN | ISIG  | IGNPAR);
+
+    /* output options */
+    termConfig.c_oflag &= ~(OCRNL | ONLCR | ONLRET |
+                            ONOCR | OFILL | OLCUC  | OPOST);
+
+/* input options */
+    termConfig.c_iflag = ~(IGNBRK | BRKINT | ICRNL | IGNCR   |
+                           INLCR  | PARMRK | INPCK | ISTRIP  | IXON |
+                           IXOFF  | IUCLC  | IXANY | IMAXBEL | IUTF8);
+
+    /* overall read timer (2 seconds) */
+    termConfig.c_cc[VTIME] = 20;
+
+    cfsetispeed(&termConfig, RS485_BAUDRATE);
+    cfsetospeed(&termConfig, RS485_BAUDRATE);
+
+    if (tcsetattr(fd, TCSAFLUSH, &termConfig) < 0) {
+        fprintf(stderr, "%s tcsetattr failed\n", tty);
+        tcsetattr(fd, TCSAFLUSH, &savedTermConfig);
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 int main(int argc, char **argv)
 {
-    char *path;
     unsigned int pulse_counter = 0;
     unsigned sequences = 0;
+    char osc_port[8];
+    int opt = 0;
+    lo_server s;
+    int lo_fd = -1;
+    int rs485_fd = -1;
+    fd_set rfds;
+    struct timeval tv;
+    int retval;
 
-
-    if (!bcm2835_init())
-        return 1;
-
-    bcm2835_gpio_fsel(OUTPIN, BCM2835_GPIO_FSEL_OUTP);
-    bcm2835_gpio_fsel(INPIN, BCM2835_GPIO_FSEL_INPT);
-    bcm2835_gpio_set_pud(INPIN, BCM2835_GPIO_PUD_OFF);
-    bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
-
+    program = basename(argv[0]);
     srand(time(NULL));
 
-    if (argc < 2)
-        path = "/opt/lumiere/bin/sequences/lumiere_default_sequence.txt";
-    else {
-        path = argv[1];
-        if (argc >= 3) {
-            int level = 0;
-
-            if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
-            bcm2835_delay(200);
-            if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
-            bcm2835_delay(200);
-            if ( READVAL() ) level++;
-            bcm2825_gpio_write(OUTPIN, bcm2835_gpio_lev(INPIN));
-
-            if (level >= 2) {
-                path = argv[2];
-            } else {
-                path = argv[1];
-            }
+    while ((opt = getopt(argc, argv, "p:")) != -1)
+    {
+        switch (opt)
+        {
+            case 'p':
+                strncpy(osc_port, optarg, 8);
+                break;
+            default:
+                usage();
+                break;
         }
     }
-    sequences = open_sequence_file(path);
 
-    if (sequences <= 0) {
-        printf("Warning no sequences read\n");
-        exit(1);
+    if (optind >= argc) {
+        usage();
     }
 
+    if ((sequences = open_sequence_file(argv[optind])) <= 0) {
+        fprintf(stderr, "unable to load sequence file '%s'\n", argv[optind]);
+        exit(2);
+    }
+
+    fprintf(stdout, "loaded %d sequence lines\n", sequences);
+
+    if (!bcm2835_init())
+        exit(3);
+    initialize_gpio_pins();
+
+    rs485_fd = initialize_RS485(RS485_TTY);
+
+    fprintf(stdout, "We are %s\n", (is_master() == IS_MASTER) ? "MASTER" : "SLAVE");
+
+    fprintf(stdout, "starting OSC server at port %s\n", osc_port);
+    s = lo_server_new(osc_port, osc_error);
+    lo_server_add_method(s, NULL, NULL, generic_handler, NULL);
+    lo_server_add_method(s, "/play", "i", play_handler, NULL);
+    lo_server_add_method(s, "/quit", "", quit_handler, NULL);
+    lo_fd = lo_server_get_socket_fd(s);
+
+    if (lo_fd <= 0) {
+        fprintf(stderr, "Could not get osc server file descriptor\n");
+        exit(4);
+    }
+
+    do {
+
+        FD_ZERO(&rfds);
+        FD_SET(0, &rfds);       /* stdin */
+        FD_SET(lo_fd, &rfds);
+        FD_SET(rs485_fd, &rfds);
+
+        retval = select(((lo_fd > rs485_fd) ? lo_fd : rs485_fd) + 1, &rfds,
+                    NULL, NULL, NULL);
+
+        if (retval == -1) {
+            printf("select() error\n");
+            exit(1);
+        } else if (retval > 0) {
+            if (FD_ISSET(0, &rfds)) {
+                read_stdin();
+            }
+            if (FD_ISSET(lo_fd, &rfds)) {
+                lo_server_recv_noblock(s, 0);
+            }
+        }
+    } while (!done);
+
+/*
     while (1) {
         execute_line(pulse_counter);
 
@@ -174,8 +379,10 @@ int main(int argc, char **argv)
 
         wait_for_high_pulse();
     }
-
+*/
     bcm2835_close();
 
     return 0;
 }
+
+/* vi:set ts=8 sts=4 sw=4: */
