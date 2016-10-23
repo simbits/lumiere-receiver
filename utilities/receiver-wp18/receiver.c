@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,20 +37,36 @@
 
 #define READVAL()  bcm2835_gpio_lev( SIGNAL_IN_PIN )
 
+#define USE_MULTICAST   1
+
 #include <stdio.h>
 
-const char *program = NULL;
-int done = 0;
-int master = IS_UNKNOWN;
+static const char *program = NULL;
+static int done = 0;
+static int master = IS_UNKNOWN;
+static char *sequence_lines[MAX_SEQ_LINES];
+static unsigned int sequences_loaded = 0;
+static int current_line = -1;
 
-void execute_line(unsigned int n);
+static void execute_line(unsigned int n);
+static void execute_next_line(void);
+static void execute_prev_line(void);
+static void do_reboot(void);
 
 void usage(void)
 {
-    fprintf(stderr, "Usage: %s -p <OSC port> <sequence file>\n", program);
+    fprintf(stderr, "Usage: %s -p <OSC port> -a <ip address> -d <delay seconds) <sequence file>\n", program);
     fprintf(stderr, "    -p - set osc listen / send port\n");
+    fprintf(stderr, "    -a - set send address\n");
+    fprintf(stderr, "    -d - set delay in seconds between movies if master\n");
 
     exit(1);
+}
+
+void do_reboot(void)
+{
+    fprintf(stderr, "\n\nrebooting...\n");
+    system("/sbin/reboot");
 }
 
 void osc_error(int num, const char *msg, const char *path)
@@ -88,6 +105,27 @@ int play_handler(const char *path, const char *types, lo_arg ** argv,
         return 0;
 }
 
+int next_handler(const char *path, const char *types, lo_arg ** argv,
+                         int argc, void *data, void *user_data)
+{
+        execute_next_line();
+        return 0;
+}
+
+int prev_handler(const char *path, const char *types, lo_arg ** argv,
+                         int argc, void *data, void *user_data)
+{
+        execute_prev_line();
+        return 0;
+}
+
+int reboot_handler(const char *path, const char *types, lo_arg ** argv,
+                         int argc, void *data, void *user_data)
+{
+        do_reboot();
+        return 0;
+}
+
 int quit_handler(const char *path, const char *types, lo_arg ** argv,
                          int argc, void *data, void *user_data)
 {
@@ -97,19 +135,33 @@ int quit_handler(const char *path, const char *types, lo_arg ** argv,
         return 0;
 }
 
-void read_stdin(void)
+void read_tty(int fd)
 {
     char buf[256];
-    int len = read(0, buf, 256);
+    int len = read(fd, buf, 256);
     if (len > 0) {
-        printf("stdin: ");
+        printf("rs485: ");
         fwrite(buf, len, 1, stdout);
         printf("\n");
         fflush(stdout);
     }
+
+    char c = buf[0];
+    if (c == 'n') {
+        execute_next_line();
+    } else if (c == 'p') {
+        execute_prev_line();
+    } else if (c == 'r') {
+        do_reboot();
+    } else {
+        errno = 0;
+        long int n = strtol(buf, NULL, 10);
+        if (errno == 0) {
+            execute_line((int)n);
+        }
+    }
 }
 
-char *sequence_lines[MAX_SEQ_LINES];
 
 int open_sequence_file(const char *path)
 {
@@ -171,7 +223,7 @@ void execute_line(unsigned int n)
     char cmd;
     char *line;
 
-    if (n >= MAX_SEQ_LINES) {
+    if (n < 0 || n >= sequences_loaded || n >= MAX_SEQ_LINES) {
         printf("Error: sequence line %d out of bounds\n", n);
         return;
     }
@@ -195,6 +247,24 @@ void execute_line(unsigned int n)
         default:
             break;
     }
+
+    current_line = n;
+}
+
+void execute_next_line(void)
+{
+    int n = current_line + 1;
+    if (n >= sequences_loaded)
+        n = 0;
+    execute_line(n);
+}
+
+void execute_prev_line(void)
+{
+    int n = current_line - 1;
+    if (n < 0)
+        n = sequences_loaded - 1;
+    execute_line(n);
 }
 
 int is_master(void)
@@ -288,25 +358,34 @@ int initialize_RS485(const char *tty)
 int main(int argc, char **argv)
 {
     unsigned int pulse_counter = 0;
-    unsigned sequences = 0;
     char osc_port[8];
+    char ip[16] = "0.0.0.0";
     int opt = 0;
     lo_server s;
     int lo_fd = -1;
     int rs485_fd = -1;
     fd_set rfds;
-    struct timeval tv;
+    struct timeval tv, *tvp;
     int retval;
+    float sequence_delay = 0.0;
+    int use_osc = 0;
 
     program = basename(argv[0]);
     srand(time(NULL));
 
-    while ((opt = getopt(argc, argv, "p:")) != -1)
+    while ((opt = getopt(argc, argv, "p:a:d:")) != -1)
     {
         switch (opt)
         {
             case 'p':
                 strncpy(osc_port, optarg, 8);
+                break;
+            case 'a':
+                strncpy(ip, optarg, 16);
+                use_osc = 1;
+                break;
+            case 'd':
+                sequence_delay = atof(optarg);
                 break;
             default:
                 usage();
@@ -318,12 +397,12 @@ int main(int argc, char **argv)
         usage();
     }
 
-    if ((sequences = open_sequence_file(argv[optind])) <= 0) {
+    if ((sequences_loaded = open_sequence_file(argv[optind])) <= 0) {
         fprintf(stderr, "unable to load sequence file '%s'\n", argv[optind]);
         exit(2);
     }
 
-    fprintf(stdout, "loaded %d sequence lines\n", sequences);
+    fprintf(stdout, "loaded %d sequence lines\n", sequences_loaded);
 
     if (!bcm2835_init())
         exit(3);
@@ -334,10 +413,17 @@ int main(int argc, char **argv)
     fprintf(stdout, "We are %s\n", (is_master() == IS_MASTER) ? "MASTER" : "SLAVE");
 
     fprintf(stdout, "starting OSC server at port %s\n", osc_port);
+#ifdef USE_MULTICAST
+    s = lo_server_new_multicast(ip, osc_port, osc_error);
+#else
     s = lo_server_new(osc_port, osc_error);
+#endif
     lo_server_add_method(s, NULL, NULL, generic_handler, NULL);
     lo_server_add_method(s, "/play", "i", play_handler, NULL);
+    lo_server_add_method(s, "/next", "", next_handler, NULL);
+    lo_server_add_method(s, "/prev", "", prev_handler, NULL);
     lo_server_add_method(s, "/quit", "", quit_handler, NULL);
+    lo_server_add_method(s, "/reboot", "", reboot_handler, NULL);
     lo_fd = lo_server_get_socket_fd(s);
 
     if (lo_fd <= 0) {
@@ -348,38 +434,67 @@ int main(int argc, char **argv)
     do {
 
         FD_ZERO(&rfds);
-        FD_SET(0, &rfds);       /* stdin */
         FD_SET(lo_fd, &rfds);
         FD_SET(rs485_fd, &rfds);
 
+        if (is_master() == IS_MASTER && sequence_delay > 0.0) {
+            tv.tv_sec = floorf(sequence_delay);
+            tv.tv_usec = (sequence_delay - tv.tv_sec) * 1000000;
+            tvp = &tv;
+        } else {
+            tvp = NULL;
+        }
+
         retval = select(((lo_fd > rs485_fd) ? lo_fd : rs485_fd) + 1, &rfds,
-                    NULL, NULL, NULL);
+                    NULL, NULL, tvp);
 
         if (retval == -1) {
             printf("select() error\n");
             exit(1);
         } else if (retval > 0) {
-            if (FD_ISSET(0, &rfds)) {
-                read_stdin();
+            if (FD_ISSET(rs485_fd, &rfds)) {
+                read_tty(rs485_fd);
             }
             if (FD_ISSET(lo_fd, &rfds)) {
                 lo_server_recv_noblock(s, 0);
             }
+        } else {
+            int line = current_line + 1;
+            if (line >= sequences_loaded) {
+                line = 0;
+            }
+
+            if (use_osc) {
+                lo_address t = lo_address_new(ip, osc_port);
+#if USE_MULTICAST
+                lo_address_set_ttl(t, 1);
+#endif
+
+                if (lo_send(t, "/play", "i", line) == -1) {
+                    printf("OSC error %d: %s\n", lo_address_errno(t),
+                                                 lo_address_errstr(t));
+                }
+            } else {
+                fprintf(stdout, "Sending via RS485: %d\n", line);
+                if (bcm2835_gpio_lev(RS485_DE_PIN)) {
+                    fprintf(stderr, "someone is already writing, wait for next time\n");
+                } else {
+                    char bfr[8];
+                    int n = 0;
+                    bcm2835_gpio_write(RS485_DE_PIN, HIGH);
+                    bcm2835_delay(1);
+                    n = snprintf(bfr, 8, "%d", line);
+                    printf("writing(%d): %s\n", n, bfr);
+                    write(rs485_fd, bfr, n);
+                    bcm2835_delay(1);
+                    bcm2835_gpio_write(RS485_DE_PIN, LOW);
+                    //execute_line(line);
+                }
+            }
         }
     } while (!done);
 
-/*
-    while (1) {
-        execute_line(pulse_counter);
-
-        if (++pulse_counter >= sequences)
-            pulse_counter = 0;
-
-        bcm2835_delayMicroseconds(100);
-
-        wait_for_high_pulse();
-    }
-*/
+    close(rs485_fd);
     bcm2835_close();
 
     return 0;
