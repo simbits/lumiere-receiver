@@ -140,9 +140,9 @@ void read_tty(int fd)
     char buf[256];
     int len = read(fd, buf, 256);
     if (len > 0) {
-        printf("rs485: ");
+        fprintf(stdout, "Recv RS485: ");
         fwrite(buf, len, 1, stdout);
-        printf("\n");
+        fprintf(stdout, "\n");
         fflush(stdout);
     }
 
@@ -411,30 +411,48 @@ int main(int argc, char **argv)
     rs485_fd = initialize_RS485(RS485_TTY);
 
     fprintf(stdout, "We are %s\n", (is_master() == IS_MASTER) ? "MASTER" : "SLAVE");
-
-    fprintf(stdout, "starting OSC server at port %s\n", osc_port);
-#ifdef USE_MULTICAST
-    s = lo_server_new_multicast(ip, osc_port, osc_error);
-#else
-    s = lo_server_new(osc_port, osc_error);
-#endif
-    lo_server_add_method(s, NULL, NULL, generic_handler, NULL);
-    lo_server_add_method(s, "/play", "i", play_handler, NULL);
-    lo_server_add_method(s, "/next", "", next_handler, NULL);
-    lo_server_add_method(s, "/prev", "", prev_handler, NULL);
-    lo_server_add_method(s, "/quit", "", quit_handler, NULL);
-    lo_server_add_method(s, "/reboot", "", reboot_handler, NULL);
-    lo_fd = lo_server_get_socket_fd(s);
-
-    if (lo_fd <= 0) {
-        fprintf(stderr, "Could not get osc server file descriptor\n");
-        exit(4);
+    if (is_master() == IS_MASTER) {
+        fprintf(stdout, "  seqeuence line delay is %f seconds\n", sequence_delay);
     }
+
+    if (use_osc) {
+#ifdef USE_MULTICAST
+        fprintf(stdout, "starting multicast OSC\n");
+        fprintf(stdout, "  port: %s\n", osc_port);
+        fprintf(stdout, "  multicast group: %s\n", ip);
+        s = lo_server_new_multicast(ip, osc_port, osc_error);
+#else
+        fprintf(stdout, "starting unicast OSC\n");
+        fprintf(stdout, "  port: %s\n", osc_port);
+        fprintf(stdout, "  ip: %s\n", ip);
+        s = lo_server_new(osc_port, osc_error);
+#endif
+
+        lo_server_add_method(s, NULL, NULL, generic_handler, NULL);
+        lo_server_add_method(s, "/play", "i", play_handler, NULL);
+        lo_server_add_method(s, "/next", "", next_handler, NULL);
+        lo_server_add_method(s, "/prev", "", prev_handler, NULL);
+        lo_server_add_method(s, "/quit", "", quit_handler, NULL);
+        lo_server_add_method(s, "/reboot", "", reboot_handler, NULL);
+        lo_fd = lo_server_get_socket_fd(s);
+
+        if (lo_fd <= 0) {
+            fprintf(stderr, "Could not get osc server file descriptor\n");
+            fprintf(stderr, "  falling back on RS485\n");
+            use_osc = 0;
+            lo_fd = -1;;
+        }
+    } else {
+        fprintf(stdout, "Using RS485 as command interface\n");
+        lo_fd = -1;
+    }
+
+    execute_line(0);
 
     do {
 
         FD_ZERO(&rfds);
-        FD_SET(lo_fd, &rfds);
+        if (use_osc) FD_SET(lo_fd, &rfds);
         FD_SET(rs485_fd, &rfds);
 
         if (is_master() == IS_MASTER && sequence_delay > 0.0) {
@@ -455,7 +473,7 @@ int main(int argc, char **argv)
             if (FD_ISSET(rs485_fd, &rfds)) {
                 read_tty(rs485_fd);
             }
-            if (FD_ISSET(lo_fd, &rfds)) {
+            if (use_osc && FD_ISSET(lo_fd, &rfds)) {
                 lo_server_recv_noblock(s, 0);
             }
         } else {
@@ -477,18 +495,17 @@ int main(int argc, char **argv)
             } else {
                 fprintf(stdout, "Sending via RS485: %d\n", line);
                 if (bcm2835_gpio_lev(RS485_DE_PIN)) {
-                    fprintf(stderr, "someone is already writing, wait for next time\n");
+                    fprintf(stderr, "Send RS485: line busy, waiting for next slot\n");
                 } else {
                     char bfr[8];
                     int n = 0;
                     bcm2835_gpio_write(RS485_DE_PIN, HIGH);
                     bcm2835_delay(1);
                     n = snprintf(bfr, 8, "%d", line);
-                    printf("writing(%d): %s\n", n, bfr);
+                    printf(stdout, "Send RS485: %s\n", n, bfr);
                     write(rs485_fd, bfr, n);
                     bcm2835_delay(1);
                     bcm2835_gpio_write(RS485_DE_PIN, LOW);
-                    //execute_line(line);
                 }
             }
         }
