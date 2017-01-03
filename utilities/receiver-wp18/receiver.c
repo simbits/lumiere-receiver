@@ -63,6 +63,31 @@ void usage(void)
     exit(1);
 }
 
+void set_high_power(void)
+{
+    system("/opt/lumiere/bin/utils/set_high_power.sh");
+}
+
+void set_low_power(void)
+{
+    system("/opt/lumiere/bin/utils/set_low_power.sh");
+}
+
+void led_off(void)
+{
+    //system("/opt/lumiere/bin/utils/led_off.sh");
+}
+
+void led_on(void)
+{
+    //system("/opt/lumiere/bin/utils/led_on.sh");
+}
+
+void projector_test_cycle(void)
+{
+    system("/opt/lumiere/bin/utils/cycle_test_pattern.sh");
+}
+
 void do_reboot(void)
 {
     fprintf(stderr, "\n\nrebooting...\n");
@@ -91,6 +116,41 @@ int generic_handler(const char *path, const char *types, lo_arg ** argv,
     fflush(stdout);
 
     return 1;
+}
+
+int led_high_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+    set_high_power();
+    return 0;
+}
+
+int led_low_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+    set_low_power();
+    return 0;
+}
+
+int led_off_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+    led_off();
+    return 0;
+}
+
+int led_on_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+    led_on();
+    return 0;
+}
+
+int projector_test_handler(const char *path, const char *types, lo_arg ** argv,
+                        int argc, void *data, void *user_data)
+{
+    projector_test_cycle();
+    return 0;
 }
 
 int play_handler(const char *path, const char *types, lo_arg ** argv,
@@ -153,6 +213,16 @@ void read_tty(int fd)
         execute_prev_line();
     } else if (c == 'r') {
         do_reboot();
+    } else if (c == 'h') {
+        set_high_power();
+    } else if (c == 'l') {
+        set_low_power();
+    } else if (c == 'n') {
+        led_on();
+    } else if (c == 'f') {
+        led_off();
+    } else if (c == 't') {
+        projector_test_cycle();
     } else {
         errno = 0;
         long int n = strtol(buf, NULL, 10);
@@ -434,6 +504,10 @@ int main(int argc, char **argv)
         lo_server_add_method(s, "/prev", "", prev_handler, NULL);
         lo_server_add_method(s, "/quit", "", quit_handler, NULL);
         lo_server_add_method(s, "/reboot", "", reboot_handler, NULL);
+        lo_server_add_method(s, "/led/high", "", led_high_handler, NULL);
+        lo_server_add_method(s, "/led/low", "", led_low_handler, NULL);
+        lo_server_add_method(s, "/led/off", "", led_off_handler, NULL);
+        lo_server_add_method(s, "/projector/test", "", projector_test_handler, NULL);
         lo_fd = lo_server_get_socket_fd(s);
 
         if (lo_fd <= 0) {
