@@ -75,12 +75,12 @@ void set_low_power(void)
 
 void led_off(void)
 {
-    //system("/opt/lumiere/bin/utils/led_off.sh");
+    system("/opt/lumiere/bin/utils/led_off.sh");
 }
 
 void led_on(void)
 {
-    //system("/opt/lumiere/bin/utils/led_on.sh");
+    system("/opt/lumiere/bin/utils/led_on.sh");
 }
 
 void projector_test_cycle(void)
@@ -217,7 +217,7 @@ void read_tty(int fd)
         set_high_power();
     } else if (c == 'l') {
         set_low_power();
-    } else if (c == 'n') {
+    } else if (c == 'o') {
         led_on();
     } else if (c == 'f') {
         led_off();
@@ -507,6 +507,7 @@ int main(int argc, char **argv)
         lo_server_add_method(s, "/led/high", "", led_high_handler, NULL);
         lo_server_add_method(s, "/led/low", "", led_low_handler, NULL);
         lo_server_add_method(s, "/led/off", "", led_off_handler, NULL);
+        lo_server_add_method(s, "/led/on", "", led_on_handler, NULL);
         lo_server_add_method(s, "/projector/test", "", projector_test_handler, NULL);
         lo_fd = lo_server_get_socket_fd(s);
 
